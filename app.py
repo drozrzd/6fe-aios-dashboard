@@ -58,6 +58,25 @@ GROQ_API_KEY       = _secret("GROQ_API_KEY")
 CARLOS_PROMPT_PATH = Path(__file__).parents[2] / "(C)Carlos-Voice-System-Prompt.md"
 
 
+def _inbound_secret(key: str) -> str:
+    """Read from the inbound-agent .env directly (different Supabase project)."""
+    try:
+        return st.secrets[f"INBOUND_{key}"]
+    except Exception:
+        pass
+    _env = Path(__file__).parents[2] / "01 Acquisition" / "inbound-agent" / ".env"
+    if _env.exists():
+        for line in _env.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line.startswith(f"{key}="):
+                return line[len(key) + 1:].strip()
+    return ""
+
+
+INBOUND_SUPABASE_URL = _inbound_secret("SUPABASE_URL")
+INBOUND_SUPABASE_KEY = _inbound_secret("SUPABASE_KEY")
+
+
 # ── Connections ───────────────────────────────────────────────────────────────
 
 @st.cache_resource
@@ -68,6 +87,15 @@ def get_db() -> Client:
 @st.cache_resource
 def get_groq() -> Groq:
     return Groq(api_key=GROQ_API_KEY)
+
+
+@st.cache_resource
+def get_inbound_db() -> Client:
+    return create_client(INBOUND_SUPABASE_URL, INBOUND_SUPABASE_KEY)
+
+
+def idb() -> Client:
+    return get_inbound_db()
 
 
 # ── Data helpers ──────────────────────────────────────────────────────────────
@@ -187,6 +215,114 @@ def fetch_sandbox_tests(limit: int = 10) -> list[dict]:
     return result.data or []
 
 
+# ── Inbound agent data helpers ────────────────────────────────────────────────
+
+def ib_leads_by_state() -> dict:
+    rows = idb().table("ig_leads").select("state").execute().data or []
+    return dict(Counter(r["state"] for r in rows))
+
+
+def ib_recent_leads(limit: int = 12) -> list:
+    return (
+        idb().table("ig_leads")
+        .select("first_name, ig_username, state, trigger_word, current_question, "
+                "follow_up_count, call_confirmed, last_message_at, created_at")
+        .order("created_at", desc=True)
+        .limit(limit)
+        .execute()
+        .data or []
+    )
+
+
+def ib_runs(limit: int = 20) -> list:
+    return (
+        idb().table("ig_runs")
+        .select("*")
+        .order("started_at", desc=True)
+        .limit(limit)
+        .execute()
+        .data or []
+    )
+
+
+def ib_today_stats() -> dict:
+    today = (datetime.now(timezone.utc)
+             .replace(hour=0, minute=0, second=0, microsecond=0)
+             .isoformat())
+    runs = (
+        idb().table("ig_runs")
+        .select("run_type, leads_processed, messages_sent, errors")
+        .gte("started_at", today)
+        .execute()
+        .data or []
+    )
+    return {
+        "runs":    len(runs),
+        "leads":   sum(r.get("leads_processed", 0) for r in runs),
+        "msgs":    sum(r.get("messages_sent", 0) for r in runs),
+        "errors":  sum(len(r.get("errors") or []) for r in runs),
+    }
+
+
+def ib_last_run() -> dict | None:
+    rows = (
+        idb().table("ig_runs")
+        .select("run_type, started_at, errors")
+        .order("started_at", desc=True)
+        .limit(1)
+        .execute()
+        .data or []
+    )
+    return rows[0] if rows else None
+
+
+def ib_intent_distribution() -> dict:
+    rows = (
+        idb().table("ig_messages")
+        .select("intent_label")
+        .eq("direction", "inbound")
+        .not_.is_("intent_label", "null")
+        .execute()
+        .data or []
+    )
+    return dict(Counter(r["intent_label"] for r in rows if r.get("intent_label")))
+
+
+def ib_training_counts() -> dict:
+    rows = idb().table("ig_training_examples").select("outcome").execute().data or []
+    counts = Counter(r["outcome"] for r in rows)
+    return {"total": len(rows), **counts}
+
+
+def ib_save_feedback(
+    agent_name: str,
+    bad_response: str = "",
+    good_response: str = "",
+    rule_text: str = "",
+    rating: str = "",
+    note: str = "",
+) -> None:
+    row: dict = {"agent_name": agent_name}
+    if bad_response:
+        row["bad_response"] = bad_response
+    if good_response:
+        row["good_response"] = good_response
+    if rule_text:
+        row["rule_text"] = rule_text
+    if rating:
+        row["rating"] = rating
+    if note:
+        row["note"] = note
+    idb().table("ig_feedback").insert(row).execute()
+
+
+def ib_fetch_feedback(agent_name: str = "", limit: int = 20) -> list:
+    q = idb().table("ig_feedback").select("*").order("created_at", desc=True).limit(limit)
+    if agent_name:
+        q = q.eq("agent_name", agent_name)
+    return q.execute().data or []
+
+
 # ── Write actions ─────────────────────────────────────────────────────────────
 
 def approve_draft(draft_id: int, edited_reply: str = None, edit_note: str = None) -> None:
@@ -217,7 +353,9 @@ def save_sandbox(post_text, category, author, reply, rating=None, note=None) -> 
 
 
 def generate_sandbox_reply(post_text: str, category: str, author: str) -> str:
-    system = CARLOS_PROMPT_PATH.read_text() if CARLOS_PROMPT_PATH.exists() else "You are Carlos."
+    # Read system prompt from Supabase (same source as the live agent)
+    _cfg = db().table("config").select("value").eq("key", "carlos_system_prompt").maybe_single().execute()
+    system = (_cfg.data or {}).get("value") or "You are Carlos. Be direct. Push action."
     user_msg = f"""Reply to this Skool post as Carlos.
 
 Category: {category}
@@ -240,7 +378,7 @@ Follow: Reality → Reframe → Actions (1-3 max) → Push. Short. No fluff."""
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 
 st.sidebar.title("🤖 AIOS Control Plane")
-st.sidebar.caption("6FigureEngineer · Delivery Agent")
+st.sidebar.caption("6FigureEngineer · AI Operations")
 st.sidebar.divider()
 
 _pending_count = len(fetch_pending_drafts())
@@ -248,7 +386,8 @@ _pending_count = len(fetch_pending_drafts())
 page = st.sidebar.radio(
     "Navigate",
     [
-        "📊 Overview",
+        "🔁 Inbound Agent",
+        "📊 Delivery Agent",
         f"✅ Approval Queue  ({_pending_count} pending)",
         "📈 KPIs & Mistakes",
         "🧠 Train Agent",
@@ -264,8 +403,269 @@ if st.sidebar.button("🔄 Refresh", use_container_width=True):
 # PAGE: Overview
 # ═══════════════════════════════════════════════════════════════════════════════
 
-if page == "📊 Overview":
-    st.title("📊 Overview")
+# ═══════════════════════════════════════════════════════════════════════════════
+# PAGE: Inbound Agent
+# ═══════════════════════════════════════════════════════════════════════════════
+
+if page == "🔁 Inbound Agent":
+    st.title("🔁 Inbound Instagram Agent")
+    st.caption("Live monitoring for the IG DM qualification system · polls GHL every 2 min")
+
+    # ── System health banner ──────────────────────────────────────────────────
+    today_stats = ib_today_stats()
+    last_run    = ib_last_run()
+
+    h1, h2, h3, h4, h5 = st.columns(5)
+    h1.metric("Leads today",    today_stats["leads"])
+    h2.metric("Messages sent",  today_stats["msgs"])
+    h3.metric("Poll cycles",    today_stats["runs"])
+    h4.metric("Errors today",   today_stats["errors"],
+              delta="⚠ check logs" if today_stats["errors"] else None,
+              delta_color="inverse")
+
+    if last_run:
+        last_errors = last_run.get("errors") or []
+        last_ts     = fmt_ts(last_run.get("started_at", ""))
+        status_icon = "🔴" if last_errors else "🟢"
+        h5.metric("Last poll", last_ts, delta=status_icon)
+    else:
+        h5.metric("Last poll", "No runs yet")
+
+    st.divider()
+
+    # ── Lead pipeline funnel ──────────────────────────────────────────────────
+    st.subheader("Lead Pipeline")
+
+    states      = ib_leads_by_state()
+    total_leads = sum(states.values())
+
+    FUNNEL = [
+        ("TRIGGERED",    "🟡", "Triggered"),
+        ("QUALIFYING",   "🔵", "Qualifying"),
+        ("CALL_OFFERED", "🟠", "Call offered"),
+        ("CONFIRMED",    "🟢", "Confirmed"),
+    ]
+    TERMINAL = [
+        ("GHOSTED",      "👻", "Ghosted"),
+        ("UNQUALIFIED",  "❌", "Unqualified"),
+    ]
+
+    if total_leads == 0:
+        st.info("No leads yet. Send a DM with 'FREELANCE' to the 6FE Instagram account to trigger the agent.")
+    else:
+        f_cols = st.columns(len(FUNNEL) + len(TERMINAL))
+        for i, (state, icon, label) in enumerate(FUNNEL):
+            n = states.get(state, 0)
+            pct = round(n / total_leads * 100) if total_leads else 0
+            f_cols[i].metric(f"{icon} {label}", n, help=f"{pct}% of all leads")
+
+        st.caption("─" * 4 + " terminal " + "─" * 4)
+        t_cols = st.columns(len(TERMINAL) + 4)
+        for i, (state, icon, label) in enumerate(TERMINAL):
+            n = states.get(state, 0)
+            t_cols[i].metric(f"{icon} {label}", n)
+
+        # Conversion summary
+        offered   = states.get("CALL_OFFERED", 0) + states.get("CONFIRMED", 0)
+        confirmed = states.get("CONFIRMED", 0)
+        if offered:
+            conv = round(confirmed / offered * 100)
+            st.caption(f"Call → Confirmed conversion: **{conv}%** ({confirmed}/{offered})")
+
+    st.divider()
+
+    # ── Agent monitoring cards ────────────────────────────────────────────────
+    st.subheader("Agent Status")
+
+    runs_all  = ib_runs(limit=100)
+    intents   = ib_intent_distribution()
+    training  = ib_training_counts()
+
+    inbound_runs = [r for r in runs_all if r["run_type"] == "inbound_message"]
+    n_inbound    = len(inbound_runs)
+    top_intent   = max(intents, key=intents.get) if intents else "—"
+    n_classified = sum(intents.values())
+
+    qualifying_leads  = states.get("QUALIFYING", 0)
+    call_offered      = states.get("CALL_OFFERED", 0)
+    confirmed_leads   = states.get("CONFIRMED", 0)
+    unqualified_leads = states.get("UNQUALIFIED", 0)
+
+    # Determine system-level status from last run
+    def _agent_status(last_active_ts: str | None, has_error: bool = False) -> str:
+        if has_error:
+            return "🔴 Error"
+        if not last_active_ts:
+            return "⚪ No data"
+        try:
+            dt = datetime.fromisoformat(last_active_ts.replace("Z", "+00:00"))
+            mins_ago = (datetime.now(timezone.utc) - dt).total_seconds() / 60
+            return "🟢 Active" if mins_ago < 60 else "🟡 Idle"
+        except Exception:
+            return "⚪ Unknown"
+
+    last_run_ts = (last_run or {}).get("started_at")
+    last_run_err = bool((last_run or {}).get("errors"))
+    sys_status = _agent_status(last_run_ts, last_run_err)
+
+    AGENTS = [
+        {
+            "title":   "Supervisor Agent",
+            "icon":    "🧠",
+            "desc":    "Routes every inbound message to the correct worker node",
+            "metrics": [
+                ("Dispatches (all time)", n_inbound),
+                ("Today",               today_stats["leads"]),
+            ],
+            "detail": f"Top intent routed: **{top_intent}**",
+            "status": sys_status,
+        },
+        {
+            "title":   "Intent & Context Agent",
+            "icon":    "🔍",
+            "desc":    "Classifies lead intent before every supervisor decision",
+            "metrics": [
+                ("Labels assigned", n_classified),
+                ("Unique intents",  len(intents)),
+            ],
+            "detail": (
+                "\n".join(f"- `{k}`: {v}" for k, v in
+                          sorted(intents.items(), key=lambda x: -x[1])[:4])
+                or "No labels yet"
+            ),
+            "status": sys_status,
+        },
+        {
+            "title":   "Qualification Agent",
+            "icon":    "📋",
+            "desc":    "Drives Carlos's 11-question funnel one question at a time",
+            "metrics": [
+                ("Active (in Q flow)", qualifying_leads),
+                ("Q flow completions", states.get("CALL_OFFERED", 0) + confirmed_leads),
+            ],
+            "detail":  "Handles price/trust objections inline — no detour nodes",
+            "status":  "🟢 Active" if qualifying_leads > 0 else sys_status,
+        },
+        {
+            "title":   "Booking & CRM Agent",
+            "icon":    "📅",
+            "desc":    "Sends the Calendly offer and confirms screenshot receipt",
+            "metrics": [
+                ("Calls offered",   call_offered + confirmed_leads),
+                ("Calls confirmed", confirmed_leads),
+            ],
+            "detail": (
+                f"Conversion: **{round(confirmed_leads / (call_offered + confirmed_leads) * 100)}%**"
+                if (call_offered + confirmed_leads) > 0 else "No offers yet"
+            ),
+            "status": "🟢 Active" if confirmed_leads > 0 else sys_status,
+        },
+        {
+            "title":   "Graceful Close Agent",
+            "icon":    "🤝",
+            "desc":    "Politely exits leads who only want clients, not coaching",
+            "metrics": [
+                ("Total closes", unqualified_leads),
+                ("",             ""),
+            ],
+            "detail":  "Fires on `wants_clients_only` intent",
+            "status":  "🟡 Idle" if unqualified_leads == 0 else "🟢 Active",
+        },
+        {
+            "title":   "Training Extraction Agent",
+            "icon":    "🧬",
+            "desc":    "Labels terminal-state conversations and stores them as training data",
+            "metrics": [
+                ("Examples collected", training["total"]),
+                ("Confirmed / Ghosted",
+                 f"{training.get('confirmed', 0)} / {training.get('ghosted', 0)}"),
+            ],
+            "detail":  "Runs async when a lead reaches CONFIRMED, GHOSTED, or UNQUALIFIED",
+            "status":  "🟢 Active" if training["total"] > 0 else "⚪ No data",
+        },
+    ]
+
+    for i in range(0, len(AGENTS), 2):
+        col_a, col_b = st.columns(2)
+        for col, agent in zip((col_a, col_b), AGENTS[i:i+2]):
+            with col:
+                with st.container(border=True):
+                    st.markdown(f"### {agent['icon']} {agent['title']}")
+                    st.caption(agent["desc"])
+                    st.markdown(f"**Status:** {agent['status']}")
+                    st.divider()
+                    m_cols = st.columns(2)
+                    for j, (label, val) in enumerate(agent["metrics"]):
+                        if label:
+                            m_cols[j % 2].metric(label, val)
+                    if agent.get("detail"):
+                        st.markdown(agent["detail"])
+
+    st.divider()
+
+    # ── Recent leads table ────────────────────────────────────────────────────
+    st.subheader("Recent Leads")
+
+    leads = ib_recent_leads()
+    if not leads:
+        st.info("No leads yet.")
+    else:
+        STATE_ICONS = {
+            "TRIGGERED":    "🟡",
+            "QUALIFYING":   "🔵",
+            "CALL_OFFERED": "🟠",
+            "CONFIRMED":    "🟢",
+            "GHOSTED":      "👻",
+            "UNQUALIFIED":  "❌",
+        }
+        for lead in leads:
+            state      = lead.get("state", "")
+            icon       = STATE_ICONS.get(state, "⚪")
+            name       = lead.get("first_name") or lead.get("ig_username") or "Unknown"
+            q_num      = lead.get("current_question", 1)
+            trigger    = lead.get("trigger_word", "—")
+            last_msg   = fmt_ts(lead.get("last_message_at") or lead.get("created_at", ""))
+            confirmed  = "✅" if lead.get("call_confirmed") else ""
+            fu         = lead.get("follow_up_count", 0)
+            fu_str     = f" · {fu} follow-ups" if fu else ""
+
+            state_label = state.replace("_", " ").title()
+            detail = f"Q{q_num}" if state == "QUALIFYING" else state_label
+
+            st.text(
+                f"{icon}  {name:<20}  [{detail:<14}]  "
+                f"trigger: {(trigger or '—')[:20]:<22}  "
+                f"last msg: {last_msg}  {confirmed}{fu_str}"
+            )
+
+    st.divider()
+
+    # ── Run history ───────────────────────────────────────────────────────────
+    st.subheader("Run History")
+    runs = ib_runs(limit=20)
+    if not runs:
+        st.info("No runs recorded yet.")
+    else:
+        for run in runs:
+            rtype    = run.get("run_type", "")
+            ts       = fmt_ts(run.get("started_at", ""))
+            n_leads  = run.get("leads_processed", 0)
+            n_msgs   = run.get("messages_sent", 0)
+            errs     = run.get("errors") or []
+            icon     = "❌" if errs else ("✅" if n_msgs else "⚪")
+            err_str  = f"  ⚠ {errs[0][:60]}" if errs else ""
+            st.text(
+                f"{icon}  {ts}  [{rtype:<18}]  "
+                f"{n_leads} lead(s) · {n_msgs} sent{err_str}"
+            )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PAGE: Delivery Agent Overview
+# ═══════════════════════════════════════════════════════════════════════════════
+
+elif page == "📊 Delivery Agent":
+    st.title("📊 Delivery Agent — Overview")
 
     stats = fetch_stats()
 
@@ -487,7 +887,7 @@ elif page == "🧠 Train Agent":
         "The agent gets better with every correction — no retraining needed."
     )
 
-    tab1, tab2, tab3 = st.tabs(["🧪 Sandbox", "✍️ System Prompt", "📋 Correction Log"])
+    tab1, tab2, tab3, tab4 = st.tabs(["🧪 Sandbox", "✍️ System Prompt", "📋 Correction Log", "🔁 Inbound Feedback"])
 
     # ── Tab 1: Sandbox ─────────────────────────────────────────────────────────
     with tab1:
@@ -583,29 +983,45 @@ elif page == "🧠 Train Agent":
     with tab2:
         st.subheader("Carlos Voice System Prompt")
         st.caption(
-            "This is the core identity of the agent. Every reply generation starts here. "
+            "Stored in Supabase — editable from anywhere (Mac, cloud, phone). "
+            "The agent reads this before every reply generation. "
             "Changes take effect on the next run — no restart needed."
         )
 
-        if not CARLOS_PROMPT_PATH.exists():
-            st.error(f"Prompt file not found: `{CARLOS_PROMPT_PATH}`")
+        # Read from Supabase — works from cloud AND local
+        current = db().table("config").select("value, updated_at").eq("key", "carlos_system_prompt").maybe_single().execute()
+
+        if not current.data:
+            st.warning(
+                "⚠ System prompt not in Supabase yet.\n\n"
+                "Run this on your Mac to upload it:\n"
+                "```\ncd '04 Delivery & Support/skool-agent'\n"
+                "source venv/bin/activate\n"
+                "python seed_config.py\n```"
+            )
         else:
-            current = CARLOS_PROMPT_PATH.read_text()
+            prompt_text = current.data.get("value", "")
+            updated_at  = fmt_ts(current.data.get("updated_at", ""))
+
             new_prompt = st.text_area(
                 "System prompt:",
-                value=current,
+                value=prompt_text,
                 height=500,
                 label_visibility="collapsed",
             )
 
             pc1, pc2, _ = st.columns([1, 1, 4])
             if pc1.button("💾 Save", type="primary"):
-                CARLOS_PROMPT_PATH.write_text(new_prompt)
-                st.toast("Prompt saved ✅ — takes effect on next run.")
+                db().table("config").upsert(
+                    {"key": "carlos_system_prompt", "value": new_prompt},
+                    on_conflict="key",
+                ).execute()
+                st.toast("Prompt saved to Supabase ✅ — takes effect on next run.")
+                st.rerun()
             if pc2.button("↩ Revert"):
                 st.rerun()
 
-            st.caption(f"File: `{CARLOS_PROMPT_PATH}`")
+            st.caption(f"Last updated: {updated_at} · Stored in Supabase `config` table")
 
     # ── Tab 3: Correction Log ─────────────────────────────────────────────────
     with tab3:
@@ -647,3 +1063,126 @@ elif page == "🧠 Train Agent":
                     elif c.get("draft_reply"):
                         st.markdown("**Draft:**")
                         st.write(c["draft_reply"])
+
+    # ── Tab 4: Inbound Feedback ───────────────────────────────────────────────
+    with tab4:
+        st.subheader("Train the Inbound Agent System")
+        st.caption(
+            "Corrections and rules saved here are injected directly into the agent's prompt "
+            "on every message — no redeploy needed. Same flywheel as the Delivery Agent."
+        )
+
+        INBOUND_AGENTS = [
+            "Qualification Agent",
+            "Supervisor Agent",
+            "Intent & Context Agent",
+            "Booking & CRM Agent",
+            "Graceful Close Agent",
+            "Training Extraction Agent",
+        ]
+
+        selected_agent = st.selectbox("Which agent are you training?", INBOUND_AGENTS)
+
+        st.divider()
+
+        ftype = st.radio(
+            "Feedback type",
+            ["✏️ Message correction", "📏 Behavioral rule", "⭐ Conversation rating"],
+            horizontal=True,
+        )
+
+        # ── Message correction ────────────────────────────────────────────────
+        if ftype == "✏️ Message correction":
+            st.caption(
+                "Show the agent what it said wrong and what it should have said instead. "
+                "These become few-shot examples injected before every reply."
+            )
+            with st.form("ib_correction_form", clear_on_submit=True):
+                bad  = st.text_area("❌ What the bot said (bad response)",  height=100,
+                                    placeholder="e.g. Claro, entiendo tu situación...")
+                good = st.text_area("✅ What it should have said instead", height=100,
+                                    placeholder="e.g. Oye, ¿cuántos años llevas en tech?")
+                submitted = st.form_submit_button("💾 Save correction", type="primary")
+
+            if submitted:
+                if bad.strip() and good.strip():
+                    ib_save_feedback(selected_agent, bad_response=bad.strip(), good_response=good.strip())
+                    st.toast(f"Correction saved for {selected_agent} ✅")
+                    st.rerun()
+                else:
+                    st.warning("Fill in both fields before saving.")
+
+        # ── Behavioral rule ───────────────────────────────────────────────────
+        elif ftype == "📏 Behavioral rule":
+            st.caption(
+                "Write a rule that applies to this agent at all times. "
+                "e.g. 'Never ask about income before asking about experience.'"
+            )
+            with st.form("ib_rule_form", clear_on_submit=True):
+                rule = st.text_area("Rule", height=100,
+                                    placeholder="Never ask two questions in one message.\n"
+                                                "Always acknowledge the answer before asking the next question.")
+                submitted = st.form_submit_button("💾 Save rule", type="primary")
+
+            if submitted:
+                if rule.strip():
+                    ib_save_feedback(selected_agent, rule_text=rule.strip())
+                    st.toast(f"Rule saved for {selected_agent} ✅")
+                    st.rerun()
+                else:
+                    st.warning("Write a rule before saving.")
+
+        # ── Conversation rating ───────────────────────────────────────────────
+        else:
+            st.caption(
+                "Rate a full conversation moment — no specific correction needed. "
+                "Helps the Training Extractor label what good vs. bad looks like."
+            )
+            with st.form("ib_rating_form", clear_on_submit=True):
+                rating_choice = st.radio("Rating", ["👍 Good", "👎 Bad"], horizontal=True)
+                note = st.text_area("Optional note", height=80,
+                                    placeholder="e.g. Lead was warming up and the bot pushed too hard on the call offer")
+                submitted = st.form_submit_button("💾 Save rating", type="primary")
+
+            if submitted:
+                rating_val = "thumbs_up" if "Good" in rating_choice else "thumbs_down"
+                ib_save_feedback(selected_agent, rating=rating_val, note=note.strip() or None)
+                st.toast("Rating saved ✅")
+                st.rerun()
+
+        st.divider()
+
+        # ── Feedback log ──────────────────────────────────────────────────────
+        st.subheader(f"Recent feedback — {selected_agent}")
+
+        log_all = st.checkbox("Show all agents", value=False)
+        feed = ib_fetch_feedback(agent_name="" if log_all else selected_agent, limit=30)
+
+        if not feed:
+            st.info("No feedback saved yet for this agent. Add a correction above to start the flywheel.")
+        else:
+            FTYPE_ICONS = {
+                "thumbs_up": "👍", "thumbs_down": "👎",
+            }
+            for f in feed:
+                ts    = fmt_ts(f.get("created_at", ""), fmt="%b %d %H:%M")
+                agent = f.get("agent_name", "")
+                label = f"[{agent}]  " if log_all else ""
+
+                if f.get("bad_response"):
+                    with st.expander(f"✏️  {ts}  {label}Message correction"):
+                        c1, c2 = st.columns(2)
+                        c1.markdown("**❌ Bad:**")
+                        c1.write(f["bad_response"])
+                        c2.markdown("**✅ Good:**")
+                        c2.write(f.get("good_response", ""))
+
+                elif f.get("rule_text"):
+                    with st.expander(f"📏  {ts}  {label}Rule"):
+                        st.write(f["rule_text"])
+
+                elif f.get("rating"):
+                    icon = FTYPE_ICONS.get(f["rating"], "⭐")
+                    note_str = f"  — {f['note']}" if f.get("note") else ""
+                    with st.expander(f"{icon}  {ts}  {label}Rating{note_str[:50]}"):
+                        st.write(f.get("note") or "No note.")
