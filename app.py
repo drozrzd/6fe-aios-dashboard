@@ -25,7 +25,7 @@ from pathlib import Path
 
 import streamlit as st
 from dotenv import load_dotenv
-from groq import Groq
+from openai import OpenAI
 from supabase import create_client, Client
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -54,7 +54,8 @@ def _secret(key: str) -> str:
 
 SUPABASE_URL       = _secret("SUPABASE_URL")
 SUPABASE_KEY       = _secret("SUPABASE_KEY")
-GROQ_API_KEY       = _secret("GROQ_API_KEY")
+GEMINI_API_KEY     = _secret("GEMINI_API_KEY")
+_GEMINI_BASE_URL   = "https://generativelanguage.googleapis.com/v1beta/openai/"
 CARLOS_PROMPT_PATH = Path(__file__).parents[2] / "(C)Carlos-Voice-System-Prompt.md"
 
 
@@ -85,8 +86,8 @@ def get_db() -> Client:
 
 
 @st.cache_resource
-def get_groq() -> Groq:
-    return Groq(api_key=GROQ_API_KEY)
+def get_gemini() -> OpenAI:
+    return OpenAI(api_key=GEMINI_API_KEY, base_url=_GEMINI_BASE_URL)
 
 
 @st.cache_resource
@@ -363,8 +364,8 @@ Author: {author}
 Post: {post_text}
 
 Follow: Reality → Reframe → Actions (1-3 max) → Push. Short. No fluff."""
-    resp = get_groq().chat.completions.create(
-        model="llama-3.3-70b-versatile",
+    resp = get_gemini().chat.completions.create(
+        model="gemini-2.0-flash",
         messages=[
             {"role": "system", "content": system},
             {"role": "user",   "content": user_msg},
@@ -903,7 +904,7 @@ elif page == "🧠 Train Agent":
             submitted = st.form_submit_button("⚡ Generate Reply", type="primary")
 
         if submitted and post_text.strip():
-            with st.spinner("Calling Groq..."):
+            with st.spinner("Calling Gemini..."):
                 try:
                     reply = generate_sandbox_reply(
                         post_text, category or "General", author or "Member"
